@@ -19,7 +19,7 @@ static constexpr uint8_t HLS_REG_MODEL_L = 0x03;
 static constexpr uint8_t HLS_REG_MODEL_H = 0x04;
 static constexpr uint8_t HLS_REG_ID = 0x05;
 static constexpr uint8_t HLS_REG_BAUD = 0x06;
-static constexpr uint8_t HLS_REG_RETURN_DELAY = 0x07;
+static constexpr uint8_t HLS_REG_SECOND_ID = 0x07;
 static constexpr uint8_t HLS_REG_STATUS_LEVEL = 0x08;
 static constexpr uint8_t HLS_REG_MIN_ANGLE_L = 0x09;
 static constexpr uint8_t HLS_REG_MAX_ANGLE_L = 0x0B;
@@ -27,18 +27,36 @@ static constexpr uint8_t HLS_REG_MAX_TEMP = 0x0D;
 static constexpr uint8_t HLS_REG_MAX_VOLT = 0x0E;
 static constexpr uint8_t HLS_REG_MIN_VOLT = 0x0F;
 static constexpr uint8_t HLS_REG_MAX_TORQUE_L = 0x10;
+static constexpr uint8_t HLS_REG_SETTING = 0x12;
+static constexpr uint8_t HLS_REG_PROTECTION = 0x13;
+static constexpr uint8_t HLS_REG_LED_ALARM = 0x14;
 static constexpr uint8_t HLS_REG_P = 0x15;
 static constexpr uint8_t HLS_REG_D = 0x16;
 static constexpr uint8_t HLS_REG_I = 0x17;
 static constexpr uint8_t HLS_REG_MIN_PWM_L = 0x18;
-static constexpr uint8_t HLS_REG_OFFSET_L = 0x21;
-static constexpr uint8_t HLS_REG_MODE = 0x23;
-static constexpr uint8_t HLS_REG_PROTECT_CURRENT_L = 0x24;
+static constexpr uint8_t HLS_REG_MAX_I = 0x19;
+static constexpr uint8_t HLS_REG_CW_DEADBAND = 0x1A;
+static constexpr uint8_t HLS_REG_CCW_DEADBAND = 0x1B;
+static constexpr uint8_t HLS_REG_PROTECT_CURRENT_L = 0x1C;
+static constexpr uint8_t HLS_REG_ANGLE_RESOLUTION = 0x1E;
+static constexpr uint8_t HLS_REG_OFFSET_L = 0x1F;
+static constexpr uint8_t HLS_REG_MODE = 0x21;
+static constexpr uint8_t HLS_REG_CURRENT_P = 0x22;
+static constexpr uint8_t HLS_REG_CURRENT_I = 0x23;
+static constexpr uint8_t HLS_REG_VELOCITY_P = 0x25;
+static constexpr uint8_t HLS_REG_OVERCURRENT_TIME = 0x26;
+static constexpr uint8_t HLS_REG_VELOCITY_I = 0x27;
 static constexpr uint8_t HLS_REG_TORQUE_ENABLE = 0x28;
+static constexpr uint8_t HLS_REG_GOAL_ACCEL = 0x29;
 static constexpr uint8_t HLS_REG_GOAL_POSITION_L = 0x2A;
-static constexpr uint8_t HLS_REG_RUN_TIME_L = 0x2C;
+static constexpr uint8_t HLS_REG_GOAL_CURRENT_L = 0x2C;
+static constexpr uint8_t HLS_REG_RUN_TIME_L = HLS_REG_GOAL_CURRENT_L;
 static constexpr uint8_t HLS_REG_RUN_SPEED_L = 0x2E;
-static constexpr uint8_t HLS_REG_LOCK = 0x30;
+static constexpr uint8_t HLS_REG_TORQUE_LIMIT_L = 0x30;
+static constexpr uint8_t HLS_REG_RUNTIME_KP = 0x32;
+static constexpr uint8_t HLS_REG_RUNTIME_KD = 0x33;
+static constexpr uint8_t HLS_REG_RUNTIME_KI = 0x34;
+static constexpr uint8_t HLS_REG_LOCK = 0x37;
 static constexpr uint8_t HLS_REG_PRESENT_POSITION_L = 0x38;
 static constexpr uint8_t HLS_REG_PRESENT_SPEED_L = 0x3A;
 static constexpr uint8_t HLS_REG_PRESENT_LOAD_L = 0x3C;
@@ -63,7 +81,7 @@ public:
   void begin() {
     setDefaults();
     loadPersistent();
-    _targetPosition = clampPosition(readU16(HLS_REG_GOAL_POSITION_L));
+    _targetPosition = readU16(HLS_REG_GOAL_POSITION_L);
     _presentPosition = _targetPosition;
     _lastMotionMs = millis();
     updateDynamic();
@@ -74,6 +92,66 @@ public:
   uint32_t goodPackets() const { return _goodPackets; }
   uint32_t badPackets() const { return _badPackets; }
   uint32_t statusPackets() const { return _statusPackets; }
+  bool torqueEnabled() const { return _table[HLS_REG_TORQUE_ENABLE] != 0; }
+  uint8_t mode() const { return _table[HLS_REG_MODE]; }
+
+  uint8_t reg(uint8_t addr) const {
+    return addr < HLS_TABLE_SIZE ? _table[addr] : 0;
+  }
+
+  uint16_t regU16(uint8_t addr) const {
+    return readU16(addr);
+  }
+
+  int16_t regI16(uint8_t addr) const {
+    return static_cast<int16_t>(readU16(addr));
+  }
+
+  int16_t regSignedMagnitude15(uint8_t addr) const {
+    const uint16_t value = readU16(addr);
+    const int16_t magnitude = static_cast<int16_t>(value & 0x7FFF);
+    return (value & 0x8000) != 0 ? static_cast<int16_t>(-magnitude) : magnitude;
+  }
+
+  void setReg(uint8_t addr, uint8_t value) {
+    if (addr < HLS_TABLE_SIZE) _table[addr] = value;
+  }
+
+  void setRegU16(uint8_t addr, uint16_t value) {
+    writeU16(addr, value);
+  }
+
+  void setRegI16(uint8_t addr, int16_t value) {
+    writeU16(addr, static_cast<uint16_t>(value));
+  }
+
+  void setExternalDynamic(bool enabled) {
+    _externalDynamic = enabled;
+  }
+
+  void tick() {
+    updateDynamic();
+  }
+
+  void setHardwareFeedback(uint16_t position, int16_t speed, int16_t load,
+                           uint8_t voltage, uint8_t temperature, uint8_t moving,
+                           int16_t current, uint8_t error) {
+    writeU16(HLS_REG_PRESENT_POSITION_L, position);
+    writeU16(HLS_REG_PRESENT_SPEED_L, encodeSpeedFeedback(speed));
+    writeU16(HLS_REG_PRESENT_LOAD_L, encodeLoadFeedback(load));
+    _table[HLS_REG_PRESENT_VOLTAGE] = voltage;
+    _table[HLS_REG_PRESENT_TEMP] = temperature;
+    _table[HLS_REG_MOVING] = moving;
+    uint16_t target = readU16(HLS_REG_GOAL_POSITION_L);
+    if (_table[HLS_REG_MODE] == 1) {
+      target = readU16(HLS_REG_RUN_SPEED_L);
+    } else if (_table[HLS_REG_MODE] != 0) {
+      target = readU16(HLS_REG_GOAL_CURRENT_L);
+    }
+    writeU16(HLS_REG_CURRENT_TARGET_L, target);
+    writeU16(HLS_REG_PRESENT_CURRENT_L, encodeSignedMagnitude15(current));
+    _table[HLS_REG_ERROR] = error;
+  }
 
   static uint8_t checksum(const uint8_t *buf, size_t len) {
     uint16_t sum = 0;
@@ -153,6 +231,7 @@ private:
   uint32_t _goodPackets = 0;
   uint32_t _badPackets = 0;
   uint32_t _statusPackets = 0;
+  bool _externalDynamic = false;
   Preferences _prefs;
 
   uint16_t readU16(uint8_t addr) const {
@@ -165,6 +244,22 @@ private:
     if (addr + 1 >= HLS_TABLE_SIZE) return;
     _table[addr] = static_cast<uint8_t>(value & 0xFF);
     _table[addr + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  }
+
+  static uint16_t encodeSpeedFeedback(int16_t value) {
+    return encodeSignedMagnitude15(value);
+  }
+
+  static uint16_t encodeLoadFeedback(int16_t value) {
+    const int16_t limited = constrain(value, static_cast<int16_t>(-1000), static_cast<int16_t>(1000));
+    const uint16_t magnitude = static_cast<uint16_t>(abs(limited));
+    return limited < 0 ? static_cast<uint16_t>(0x0400 | magnitude) : magnitude;
+  }
+
+  static uint16_t encodeSignedMagnitude15(int16_t value) {
+    const int16_t limited = constrain(value, static_cast<int16_t>(-32767), static_cast<int16_t>(32767));
+    const uint16_t magnitude = static_cast<uint16_t>(abs(limited));
+    return limited < 0 ? static_cast<uint16_t>(0x8000 | magnitude) : magnitude;
   }
 
   uint16_t clampPosition(uint16_t pos) const {
@@ -185,7 +280,7 @@ private:
     _table[HLS_REG_MODEL_H] = 10;        // HLS3606 in FD setup.log
     _table[HLS_REG_ID] = _defaultId;
     _table[HLS_REG_BAUD] = _defaultBaudCode;
-    _table[HLS_REG_RETURN_DELAY] = 0;
+    _table[HLS_REG_SECOND_ID] = 0;
     _table[HLS_REG_STATUS_LEVEL] = 1;
     writeU16(HLS_REG_MIN_ANGLE_L, 0);
     writeU16(HLS_REG_MAX_ANGLE_L, 4095);
@@ -193,23 +288,40 @@ private:
     _table[HLS_REG_MAX_VOLT] = 110;
     _table[HLS_REG_MIN_VOLT] = 40;
     writeU16(HLS_REG_MAX_TORQUE_L, 1000);
-    _table[HLS_REG_P] = 15;
-    _table[HLS_REG_D] = 0;
+    _table[HLS_REG_SETTING] = 0;
+    _table[HLS_REG_PROTECTION] = 37;
+    _table[HLS_REG_LED_ALARM] = 37;
+    _table[HLS_REG_P] = 26;
+    _table[HLS_REG_D] = 4;
     _table[HLS_REG_I] = 0;
-    writeU16(HLS_REG_MIN_PWM_L, 100);
+    _table[HLS_REG_MIN_PWM_L] = 40;
+    _table[HLS_REG_MAX_I] = 0;
+    _table[HLS_REG_CW_DEADBAND] = 0;
+    _table[HLS_REG_CCW_DEADBAND] = 0;
+    writeU16(HLS_REG_PROTECT_CURRENT_L, 1000);
+    _table[HLS_REG_ANGLE_RESOLUTION] = 1;
     writeU16(HLS_REG_OFFSET_L, 0);
     _table[HLS_REG_MODE] = 0;
-    writeU16(HLS_REG_PROTECT_CURRENT_L, 1000);
-    _table[HLS_REG_TORQUE_ENABLE] = 0;
+    _table[HLS_REG_CURRENT_P] = 18;
+    _table[HLS_REG_CURRENT_I] = 4;
+    _table[HLS_REG_VELOCITY_P] = 13;
+    _table[HLS_REG_OVERCURRENT_TIME] = 100;
+    _table[HLS_REG_VELOCITY_I] = 1;
+    _table[HLS_REG_TORQUE_ENABLE] = 1;
+    _table[HLS_REG_GOAL_ACCEL] = 0;
     writeU16(HLS_REG_GOAL_POSITION_L, 2048);
-    writeU16(HLS_REG_RUN_TIME_L, 0);
+    writeU16(HLS_REG_GOAL_CURRENT_L, 0);
     writeU16(HLS_REG_RUN_SPEED_L, 0);
-    _table[HLS_REG_LOCK] = 0;
+    writeU16(HLS_REG_TORQUE_LIMIT_L, 1000);
+    _table[HLS_REG_RUNTIME_KP] = 0;
+    _table[HLS_REG_RUNTIME_KD] = 0;
+    _table[HLS_REG_RUNTIME_KI] = 0;
+    _table[HLS_REG_LOCK] = 1;
     _table[HLS_REG_PRESENT_VOLTAGE] = 60;
     _table[HLS_REG_PRESENT_TEMP] = 25;
     _table[HLS_REG_ERROR] = 0;
     _table[HLS_REG_MOVING] = 0;
-    writeU16(HLS_REG_CURRENT_TARGET_L, 2048);
+    writeU16(HLS_REG_CURRENT_TARGET_L, 0);
     writeU16(HLS_REG_PRESENT_CURRENT_L, 0);
   }
 
@@ -217,9 +329,19 @@ private:
     _prefs.begin(_prefsName, false);
     _table[HLS_REG_ID] = _prefs.getUChar("id", _table[HLS_REG_ID]);
     _table[HLS_REG_BAUD] = _prefs.getUChar("baud", _table[HLS_REG_BAUD]);
-    _table[HLS_REG_RETURN_DELAY] = _prefs.getUChar("ret", _table[HLS_REG_RETURN_DELAY]);
     _table[HLS_REG_STATUS_LEVEL] = _prefs.getUChar("stat", _table[HLS_REG_STATUS_LEVEL]);
+    _table[HLS_REG_SETTING] = _prefs.getUChar("phase", _table[HLS_REG_SETTING]);
+    _table[HLS_REG_P] = _prefs.getUChar("p", _table[HLS_REG_P]);
+    _table[HLS_REG_D] = _prefs.getUChar("d", _table[HLS_REG_D]);
+    _table[HLS_REG_I] = _prefs.getUChar("i", _table[HLS_REG_I]);
+    _table[HLS_REG_MIN_PWM_L] = _prefs.getUChar("minpwm", _table[HLS_REG_MIN_PWM_L]);
+    writeU16(HLS_REG_PROTECT_CURRENT_L, _prefs.getUShort("pcurr", readU16(HLS_REG_PROTECT_CURRENT_L)));
+    _table[HLS_REG_CURRENT_P] = _prefs.getUChar("cp", _table[HLS_REG_CURRENT_P]);
+    _table[HLS_REG_CURRENT_I] = _prefs.getUChar("ci", _table[HLS_REG_CURRENT_I]);
+    _table[HLS_REG_VELOCITY_P] = _prefs.getUChar("vp", _table[HLS_REG_VELOCITY_P]);
+    _table[HLS_REG_VELOCITY_I] = _prefs.getUChar("vi", _table[HLS_REG_VELOCITY_I]);
     _table[HLS_REG_MODE] = _prefs.getUChar("mode", _table[HLS_REG_MODE]);
+    writeU16(HLS_REG_TORQUE_LIMIT_L, _prefs.getUShort("tlimit", readU16(HLS_REG_TORQUE_LIMIT_L)));
     writeU16(HLS_REG_MIN_ANGLE_L, _prefs.getUShort("minp", readU16(HLS_REG_MIN_ANGLE_L)));
     writeU16(HLS_REG_MAX_ANGLE_L, _prefs.getUShort("maxp", readU16(HLS_REG_MAX_ANGLE_L)));
     _prefs.end();
@@ -229,9 +351,19 @@ private:
     _prefs.begin(_prefsName, false);
     _prefs.putUChar("id", _table[HLS_REG_ID]);
     _prefs.putUChar("baud", _table[HLS_REG_BAUD]);
-    _prefs.putUChar("ret", _table[HLS_REG_RETURN_DELAY]);
     _prefs.putUChar("stat", _table[HLS_REG_STATUS_LEVEL]);
+    _prefs.putUChar("phase", _table[HLS_REG_SETTING]);
+    _prefs.putUChar("p", _table[HLS_REG_P]);
+    _prefs.putUChar("d", _table[HLS_REG_D]);
+    _prefs.putUChar("i", _table[HLS_REG_I]);
+    _prefs.putUChar("minpwm", _table[HLS_REG_MIN_PWM_L]);
+    _prefs.putUShort("pcurr", readU16(HLS_REG_PROTECT_CURRENT_L));
+    _prefs.putUChar("cp", _table[HLS_REG_CURRENT_P]);
+    _prefs.putUChar("ci", _table[HLS_REG_CURRENT_I]);
+    _prefs.putUChar("vp", _table[HLS_REG_VELOCITY_P]);
+    _prefs.putUChar("vi", _table[HLS_REG_VELOCITY_I]);
     _prefs.putUChar("mode", _table[HLS_REG_MODE]);
+    _prefs.putUShort("tlimit", readU16(HLS_REG_TORQUE_LIMIT_L));
     _prefs.putUShort("minp", readU16(HLS_REG_MIN_ANGLE_L));
     _prefs.putUShort("maxp", readU16(HLS_REG_MAX_ANGLE_L));
     _prefs.end();
@@ -244,6 +376,7 @@ private:
   }
 
   void updateDynamic() {
+    if (_externalDynamic) return;
     const bool torqueOn = _table[HLS_REG_TORQUE_ENABLE] != 0;
     const uint32_t now = millis();
     const uint32_t dt = now - _lastMotionMs;
@@ -251,7 +384,7 @@ private:
     _lastMotionMs = now;
 
     if (torqueOn) {
-      _targetPosition = clampPosition(readU16(HLS_REG_GOAL_POSITION_L));
+      _targetPosition = readU16(HLS_REG_GOAL_POSITION_L);
       const int32_t diff = static_cast<int32_t>(_targetPosition) - _presentPosition;
       if (diff == 0) {
         _presentSpeed = 0;
@@ -290,7 +423,6 @@ private:
 
   void sendStatus(HlsPacketWriter writer, uint8_t err, const uint8_t *params, uint8_t paramLen) {
     if (!writer) return;
-    delayMicroseconds(static_cast<uint16_t>(_table[HLS_REG_RETURN_DELAY]) * 2U);
     uint8_t packet[HLS_DATA_MAX + 6];
     const uint8_t len = paramLen + 2;
     packet[0] = 0xFF;
@@ -329,9 +461,6 @@ private:
     }
     if (_table[HLS_REG_ID] > 253) _table[HLS_REG_ID] = _defaultId;
     if (_table[HLS_REG_BAUD] > 7) _table[HLS_REG_BAUD] = _defaultBaudCode;
-    _targetPosition = clampPosition(readU16(HLS_REG_GOAL_POSITION_L));
-    writeU16(HLS_REG_GOAL_POSITION_L, _targetPosition);
-    writeU16(HLS_REG_CURRENT_TARGET_L, _targetPosition);
     savePersistent();
   }
 

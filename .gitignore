@@ -1,5 +1,31 @@
 .vscode/
 .pio/
+.idea/
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local scratch files
 *.bak
 *.tmp
 *.log
+*.csv
+record.txt
+Thumbs.db
+.DS_Store
+desktop.ini
+logs/
+
+# Auto-tune/test output captured from the physical bus
+*_results*.json
+*_tune*.json
+*_compare*.json
+*_verify*.json
+*_sweep*.json
+speed300_*.json
+id1_*.json
+id2_*.json
+id3_*.json

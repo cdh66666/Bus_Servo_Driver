@@ -2,6 +2,7 @@
 #include <HardwareSerial.h>
 #include <Preferences.h>
 #include "HLS3606Emu.h"
+#include "BoardServoHardware.h"
 
 // COM58 firmware:
 // Pure virtual HLS3606-like servo on the shared Feetech bus.
@@ -14,6 +15,7 @@ static constexpr uint32_t DEFAULT_BUS_BAUD = 1000000;
 
 HardwareSerial BusSerial(1);
 HLS3606Emu servo(3, 0, "hls3m");
+BoardServoHardware servoHardware(servo, 0, "hls3hw", -1, 0.30f, 0.14f);
 uint32_t busBaud = 0;
 
 struct PacketParser {
@@ -126,11 +128,13 @@ void pollUsb() {
 void setup() {
   Serial.begin(USB_BAUD);
   servo.begin();
+  servoHardware.begin();
   beginBus(HLS3606Emu::baudFromCode(servo.baudCode()));
   printStatus();
 }
 
 void loop() {
+  servoHardware.update();
   while (BusSerial.available() > 0) {
     feedBusByte(static_cast<uint8_t>(BusSerial.read()));
   }

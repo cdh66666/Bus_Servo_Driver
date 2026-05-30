@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include "HLS3606Emu.h"
+#include "BoardServoHardware.h"
 
 // COM57 firmware:
 // - USB CDC is a transparent Feetech official-tool bridge.
@@ -17,6 +18,7 @@ static constexpr uint32_t SEARCH_BAUDS[] = {1000000, 115200};
 
 HardwareSerial BusSerial(1);
 HLS3606Emu localServo(2, 0, "hls2m");
+BoardServoHardware localHardware(localServo, 0, "hls2hw", 1, 1.0f, 0.25f, 0.64f);
 
 typedef void (*PacketHandler)(uint8_t, uint8_t, const uint8_t *, const uint8_t *, uint8_t);
 
@@ -301,12 +303,14 @@ bool waitForCapturedResponse(uint8_t expectedId, uint32_t timeoutMs) {
 void setup() {
   Serial.begin(USB_BAUD);
   localServo.begin();
+  localHardware.begin();
   idBaud[1] = 1000000;          // The powered HLS3915M has been verified as ID 1 at 1 Mbps.
   idBaud[3] = DEFAULT_BUS_BAUD; // COM58 virtual servo default.
   beginBus(DEFAULT_BUS_BAUD);
 }
 
 void loop() {
+  localHardware.update();
   while (Serial.available() > 0) {
     feedParser(usbParser, static_cast<uint8_t>(Serial.read()), handleUsbPacket);
   }
