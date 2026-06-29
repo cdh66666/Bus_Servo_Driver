@@ -4,12 +4,10 @@
 #include "HLS3606Emu.h"
 #include "BoardServoHardware.h"
 
-// COM58 firmware:
+// Node firmware:
 // Pure virtual HLS3606-like servo on the shared Feetech bus.
 // Default ID is 3; the real factory HLS3915M currently uses ID 1.
 
-static constexpr int8_t PIN_BUS_RX = 20;
-static constexpr int8_t PIN_BUS_TX = 21;
 static constexpr uint32_t USB_BAUD = 115200;
 static constexpr uint32_t DEFAULT_BUS_BAUD = 1000000;
 
@@ -28,6 +26,33 @@ struct PacketParser {
 
 PacketParser parser;
 String usbLine;
+
+int32_t parseNumber(const String &text, int32_t fallback = 0) {
+  char *end = nullptr;
+  const long value = strtol(text.c_str(), &end, 0);
+  return end == text.c_str() ? fallback : value;
+}
+
+int16_t decodeSignedMagnitude15(uint16_t value) {
+  const int16_t magnitude = static_cast<int16_t>(value & 0x7FFF);
+  return (value & 0x8000) != 0 ? static_cast<int16_t>(-magnitude) : magnitude;
+}
+
+int16_t decodeLoad(uint16_t value) {
+  const int16_t magnitude = static_cast<int16_t>(value & 0x03FF);
+  return (value & 0x0400) != 0 ? static_cast<int16_t>(-magnitude) : magnitude;
+}
+
+const char *encoderName(uint8_t type) {
+  switch (type) {
+    case static_cast<uint8_t>(EncoderKind::MT6701):
+      return "MT6701";
+    case static_cast<uint8_t>(EncoderKind::AS5600):
+      return "AS5600";
+    default:
+      return "NONE";
+  }
+}
 
 void beginBus(uint32_t baud) {
   if (busBaud == baud) return;
@@ -104,11 +129,76 @@ void printStatus() {
   Serial.println("=========================");
 }
 
+void printHelp() {
+  Serial.println("commands: status, diag, phase 0|1, torque 0|1, read <addr> <len>");
+}
+
+void printDiag() {
+  const int16_t position = decodeSignedMagnitude15(servo.regU16(HLS_REG_PRESENT_POSITION_L));
+  const int16_t speed = decodeSignedMagnitude15(servo.regU16(HLS_REG_PRESENT_SPEED_L));
+  const int16_t load = decodeLoad(servo.regU16(HLS_REG_PRESENT_LOAD_L));
+  const int16_t current = decodeSignedMagnitude15(servo.regU16(HLS_REG_PRESENT_CURRENT_L));
+  const int16_t effortMilli = static_cast<int16_t>(servo.regU16(HLS_DIAG_LAST_EFFORT_MILLI_L));
+  Serial.println();
+  Serial.println("=== board diag ===");
+  Serial.printf("id=%u baud=%lu mode=%u torque=%u setting=0x%02X error=0x%02X moving=%u\n",
+                servo.id(), HLS3606Emu::baudFromCode(servo.baudCode()), servo.mode(),
+                servo.reg(HLS_REG_TORQUE_ENABLE), servo.reg(HLS_REG_SETTING),
+                servo.reg(HLS_REG_ERROR), servo.reg(HLS_REG_MOVING));
+  Serial.printf("pos=%d speed=%d load=%d voltage=%.1fV temp=%u current=%d mA\n",
+                position, speed, load, servo.reg(HLS_REG_PRESENT_VOLTAGE) / 10.0f,
+                servo.reg(HLS_REG_PRESENT_TEMP), current);
+  Serial.printf("current_ipropi=%u mV current_raw=%u mA effort=%d/1000\n",
+                servo.regU16(HLS_DIAG_CURRENT_RAW_MV_L),
+                servo.regU16(HLS_DIAG_CURRENT_MA_L), effortMilli);
+  Serial.printf("encoder=%s raw14=%u first_i2c=0x%02X active_i2c=0x%02X enc_status=0x%02X\n",
+                encoderName(servo.reg(HLS_DIAG_ENCODER_TYPE)), servo.regU16(HLS_DIAG_RAW14_L),
+                servo.reg(HLS_DIAG_FIRST_I2C), servo.reg(HLS_DIAG_ACTIVE_I2C),
+                servo.reg(HLS_DIAG_ENCODER_STATUS));
+  Serial.printf("motor_fault=%u hw_error=0x%02X\n",
+                servoHardware.motorFaulted(), servoHardware.errorFlags());
+  Serial.println("==================");
+}
+
+void printRegisterRange(uint8_t addr, uint8_t len) {
+  Serial.printf("reg 0x%02X:", addr);
+  for (uint8_t i = 0; i < len; ++i) {
+    Serial.printf(" %02X", servo.reg(addr + i));
+  }
+  Serial.println();
+}
+
 void handleUsbLine(String line) {
   line.trim();
   line.toLowerCase();
   if (line == "status") {
     printStatus();
+  } else if (line == "help" || line == "?") {
+    printHelp();
+  } else if (line == "diag") {
+    printDiag();
+  } else if (line.startsWith("phase ")) {
+    const uint8_t phase = parseNumber(line.substring(6), 0) != 0 ? 1 : 0;
+    uint8_t setting = servo.reg(HLS_REG_SETTING);
+    setting = phase ? (setting | 0x01) : (setting & static_cast<uint8_t>(~0x01));
+    servo.setReg(HLS_REG_SETTING, setting);
+    servo.savePersistentSettings();
+    Serial.printf("phase invert=%u saved, setting=0x%02X\n", phase, setting);
+  } else if (line.startsWith("torque ")) {
+    const uint8_t enabled = parseNumber(line.substring(7), 0) != 0 ? 1 : 0;
+    servo.setReg(HLS_REG_TORQUE_ENABLE, enabled);
+    Serial.printf("torque=%u\n", enabled);
+  } else if (line.startsWith("read ")) {
+    const int firstSpace = line.indexOf(' ', 5);
+    if (firstSpace < 0) {
+      Serial.println("usage: read <addr> <len>");
+      return;
+    }
+    const uint8_t addr = static_cast<uint8_t>(parseNumber(line.substring(5, firstSpace), 0));
+    const uint8_t len = static_cast<uint8_t>(constrain(parseNumber(line.substring(firstSpace + 1), 1), 1, 32));
+    printRegisterRange(addr, len);
+  } else if (line.length() > 0) {
+    printHelp();
   }
 }
 
@@ -125,6 +215,19 @@ void pollUsb() {
   }
 }
 
+void updateStatusLed() {
+  static uint32_t lastToggleMs = 0;
+  static bool ledOn = false;
+  const uint32_t now = millis();
+  const bool hardwareOk = servoHardware.encoderOnline() && servoHardware.errorFlags() == 0;
+  const uint32_t intervalMs = hardwareOk ? 500 : 120;
+  if (now - lastToggleMs < intervalMs) return;
+
+  lastToggleMs = now;
+  ledOn = !ledOn;
+  digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
+}
+
 void setup() {
   Serial.begin(USB_BAUD);
   servo.begin();
@@ -135,6 +238,7 @@ void setup() {
 
 void loop() {
   servoHardware.update();
+  updateStatusLed();
   while (BusSerial.available() > 0) {
     feedBusByte(static_cast<uint8_t>(BusSerial.read()));
   }

@@ -6,16 +6,24 @@
 #include <Wire.h>
 #include "HLS3606Emu.h"
 
-static constexpr int PIN_MOTOR_EN = 1;
-static constexpr int PIN_MOTOR_PH = 2;
-static constexpr int PIN_MOTOR_NFAULT = 3;
+static constexpr const char *BOARD_HARDWARE_REVISION = "main board V1.4";
+static constexpr int8_t PIN_BUS_TX = 0;
+static constexpr int8_t PIN_BUS_RX = 1;
+static constexpr int PIN_ADC_VIN = 3;
 static constexpr int PIN_MOTOR_CURRENT = 4;
-static constexpr int PIN_I2C_SDA = 8;
-static constexpr int PIN_I2C_SCL = 9;
+static constexpr int PIN_MOTOR_EN = 5;
+static constexpr int PIN_MOTOR_PH = 6;
+static constexpr int PIN_MOTOR_NFAULT = 7;
+static constexpr int PIN_BOOT = 9;
+static constexpr int PIN_LED = 10;
+static constexpr int PIN_I2C_SCL = 18;
+static constexpr int PIN_I2C_SDA = 19;
+static constexpr int PIN_UART0_RX = 20;
+static constexpr int PIN_UART0_TX = 21;
 
 static constexpr uint8_t MT6701_I2C_ADDR = 0x06;
 static constexpr uint8_t AS5600_I2C_ADDR = 0x36;
-static constexpr uint32_t MT6701_I2C_CLOCK = 100000;
+static constexpr uint32_t MT6701_I2C_CLOCK = 400000;
 static constexpr uint32_t MOTOR_PWM_FREQ = 20000;
 static constexpr uint8_t MOTOR_PWM_RES_BITS = 10;
 static constexpr uint16_t MOTOR_PWM_MAX = (1U << MOTOR_PWM_RES_BITS) - 1U;
@@ -24,8 +32,16 @@ static constexpr float IPROPI_RESISTOR_OHMS = 2500.0f;
 static constexpr float IPROPI_UA_PER_A = 1000.0f;
 static constexpr float CURRENT_MA_PER_MV =
     1000.0f / (IPROPI_RESISTOR_OHMS * (IPROPI_UA_PER_A / 1000000.0f) * 1000.0f);
+static constexpr float VIN_DIVIDER_HIGH_OHMS = 20000.0f;
+static constexpr float VIN_DIVIDER_LOW_OHMS = 5100.0f;
+static constexpr float VIN_DIVIDER_SCALE =
+    (VIN_DIVIDER_HIGH_OHMS + VIN_DIVIDER_LOW_OHMS) / VIN_DIVIDER_LOW_OHMS;
+static constexpr float VIN_CAL_SCALE = 1.0f;
+static constexpr float VIN_CAL_OFFSET_MV = 0.0f;
 static constexpr int16_t HARDWARE_CURRENT_LIMIT_MA = 1320;
 static constexpr float FEETECH_SPEED_COUNTS_PER_UNIT = 56.0f;
+static constexpr float DEFAULT_POSITION_SPEED_4096_PER_SEC = 4096.0f;
+static constexpr float DEFAULT_POSITION_ACCEL_4096_PER_SEC2 = 16000.0f;
 static constexpr int32_t HLS_MIN_POSITION_COMMAND = -30000;
 static constexpr int32_t HLS_MAX_POSITION_COMMAND = 30000;
 
@@ -38,6 +54,10 @@ static constexpr uint8_t HLS_DIAG_MULTI_POS_0 = 0x59;
 static constexpr uint8_t HLS_DIAG_FIRST_I2C = 0x5D;
 static constexpr uint8_t HLS_DIAG_ACTIVE_I2C = 0x5E;
 static constexpr uint8_t HLS_DIAG_ENCODER_STATUS = 0x5F;
+static constexpr uint8_t HLS_DIAG_CURRENT_RAW_MV_L = 0x60;
+static constexpr uint8_t HLS_DIAG_CURRENT_MA_L = 0x62;
+static constexpr uint8_t HLS_DIAG_LAST_EFFORT_MILLI_L = 0x64;
+static constexpr uint8_t HLS_DIAG_ENCODER_TYPE = 0x66;
 
 template <typename T>
 static T clampValue(T value, T low, T high) {
@@ -88,26 +108,46 @@ private:
   float _lastEffort = 0.0f;
 };
 
-class MT6701Encoder {
+enum class EncoderKind : uint8_t {
+  None = 0,
+  MT6701 = 1,
+  AS5600 = 2,
+};
+
+class MagneticEncoder {
 public:
   void begin() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(MT6701_I2C_CLOCK);
-    scanBus();
+    detectEncoder(true);
     _online = readRaw(_lastRaw);
-    _extended = _lastRaw;
+    _extended = _online ? _lastRaw : 0;
     _lastSampleUs = micros();
   }
 
   bool update() {
     uint16_t raw = 0;
     if (!readRaw(raw)) {
+      _lostReads = _lostReads < 255 ? _lostReads + 1 : _lostReads;
       _online = false;
+      _speed4096PerSec *= 0.90f;
       return false;
     }
 
-    const int16_t diff = unwrapDiff(raw, _lastRaw);
     const uint32_t now = micros();
+    if (!_online) {
+      alignExtendedToRaw(raw);
+      _lastRaw = raw;
+      _lastSampleUs = now;
+      _speedAccumRaw = 0;
+      _speedAccumUs = 0;
+      _speed4096PerSec = 0.0f;
+      _lostReads = 0;
+      _online = true;
+      return true;
+    }
+
+    const int16_t diff = unwrapDiff(raw, _lastRaw);
     const uint32_t dt = now - _lastSampleUs;
     if (dt > 0) {
       _speedAccumRaw += diff;
@@ -128,6 +168,7 @@ public:
     _extended += diff;
     _lastRaw = raw;
     _lastSampleUs = now;
+    _lostReads = 0;
     _online = true;
     return true;
   }
@@ -161,9 +202,11 @@ public:
   uint8_t lastStatus() const { return _lastStatus; }
   uint8_t lastBytes() const { return _lastBytes; }
   uint16_t lastRaw14() const { return _lastRaw; }
+  uint8_t encoderType() const { return static_cast<uint8_t>(_kind); }
 
 private:
   bool _online = false;
+  EncoderKind _kind = EncoderKind::None;
   uint16_t _lastRaw = 0;
   int32_t _extended = 0;
   uint32_t _lastSampleUs = 0;
@@ -172,9 +215,11 @@ private:
   int32_t _speedAccumRaw = 0;
   float _speed4096PerSec = 0.0f;
   uint8_t _firstAddress = 0;
-  uint8_t _activeAddress = MT6701_I2C_ADDR;
+  uint8_t _activeAddress = 0;
   uint8_t _lastStatus = 0xFF;
   uint8_t _lastBytes = 0;
+  uint8_t _lostReads = 0;
+  uint32_t _lastDetectMs = 0;
 
   static int32_t positiveModulo(int32_t value, int32_t modulo) {
     int32_t result = value % modulo;
@@ -189,7 +234,17 @@ private:
     return diff;
   }
 
-  void scanBus() {
+  void alignExtendedToRaw(uint16_t raw) {
+    const int32_t current4096 = position4096();
+    const int32_t currentSingle = positiveModulo(current4096, 4096);
+    const int32_t newSingle = static_cast<int32_t>((raw >> 2) & 0x0FFF);
+    int32_t aligned4096 = current4096 + (newSingle - currentSingle);
+    if (aligned4096 - current4096 > 2048) aligned4096 -= 4096;
+    if (aligned4096 - current4096 < -2048) aligned4096 += 4096;
+    _extended = aligned4096 << 2;
+  }
+
+  void scanFirstAddress() {
     _firstAddress = 0;
     for (uint8_t addr = 1; addr < 0x7F; ++addr) {
       if (probeAddress(addr)) {
@@ -197,14 +252,6 @@ private:
         break;
       }
       delayMicroseconds(50);
-    }
-
-    if (probeAddress(MT6701_I2C_ADDR)) {
-      _activeAddress = MT6701_I2C_ADDR;
-    } else if (probeAddress(AS5600_I2C_ADDR)) {
-      _activeAddress = AS5600_I2C_ADDR;
-    } else {
-      _activeAddress = _firstAddress;
     }
   }
 
@@ -251,9 +298,9 @@ private:
     return true;
   }
 
-  bool readMt6701Raw(uint16_t &raw) {
+  bool readMt6701Raw(uint8_t addr, uint16_t &raw) {
     uint8_t data[2] = {};
-    if (readBurst(_activeAddress, 0x03, data, sizeof(data))) {
+    if (readBurst(addr, 0x03, data, sizeof(data))) {
       raw = (static_cast<uint16_t>(data[0]) << 8) | data[1];
       raw >>= 2;
       raw &= 0x3FFF;
@@ -263,8 +310,8 @@ private:
 
     uint8_t high = 0;
     uint8_t low = 0;
-    if (!readRegister(_activeAddress, 0x03, high)) return false;
-    if (!readRegister(_activeAddress, 0x04, low)) return false;
+    if (!readRegister(addr, 0x03, high)) return false;
+    if (!readRegister(addr, 0x04, low)) return false;
     raw = (static_cast<uint16_t>(high) << 8) | low;
     raw >>= 2;
     raw &= 0x3FFF;
@@ -273,9 +320,9 @@ private:
     return true;
   }
 
-  bool readAs5600Raw(uint16_t &raw) {
+  bool readAs5600Raw(uint8_t addr, uint16_t &raw) {
     uint8_t data[2] = {};
-    if (!readBurst(AS5600_I2C_ADDR, 0x0C, data, sizeof(data))) return false;
+    if (!readBurst(addr, 0x0C, data, sizeof(data))) return false;
     const uint16_t raw12 = ((static_cast<uint16_t>(data[0]) & 0x0F) << 8) | data[1];
     raw = (raw12 & 0x0FFF) << 2;
     _lastStatus = 2;
@@ -283,15 +330,53 @@ private:
     return true;
   }
 
-  bool readRaw(uint16_t &raw) {
-    if (_activeAddress == AS5600_I2C_ADDR) {
-      if (readAs5600Raw(raw)) return true;
-      return readMt6701Raw(raw);
+  bool activateEncoder(EncoderKind kind, uint8_t addr) {
+    _kind = kind;
+    _activeAddress = addr;
+    return true;
+  }
+
+  bool detectEncoder(bool refreshScan) {
+    if (refreshScan) scanFirstAddress();
+    _lastDetectMs = millis();
+
+    uint16_t raw = 0;
+    if (probeAddress(MT6701_I2C_ADDR) && readMt6701Raw(MT6701_I2C_ADDR, raw)) {
+      return activateEncoder(EncoderKind::MT6701, MT6701_I2C_ADDR);
     }
-    if (readMt6701Raw(raw)) return true;
-    if (_firstAddress == AS5600_I2C_ADDR || probeAddress(AS5600_I2C_ADDR)) {
-      _activeAddress = AS5600_I2C_ADDR;
-      return readAs5600Raw(raw);
+    if (probeAddress(AS5600_I2C_ADDR) && readAs5600Raw(AS5600_I2C_ADDR, raw)) {
+      return activateEncoder(EncoderKind::AS5600, AS5600_I2C_ADDR);
+    }
+
+    _kind = EncoderKind::None;
+    _activeAddress = 0;
+    _lastStatus = 0xF0;
+    _lastBytes = 0;
+    return false;
+  }
+
+  bool readActiveRaw(uint16_t &raw) {
+    switch (_kind) {
+      case EncoderKind::MT6701:
+        return readMt6701Raw(_activeAddress, raw);
+      case EncoderKind::AS5600:
+        return readAs5600Raw(_activeAddress, raw);
+      case EncoderKind::None:
+      default:
+        return false;
+    }
+  }
+
+  bool readRaw(uint16_t &raw) {
+    if (readActiveRaw(raw)) {
+      return true;
+    }
+
+    const uint32_t now = millis();
+    const bool dueForDetect =
+        _kind == EncoderKind::None ? now - _lastDetectMs > 250 : _lostReads >= 3;
+    if (dueForDetect && detectEncoder(_kind == EncoderKind::None)) {
+      return readActiveRaw(raw);
     }
     return false;
   }
@@ -313,11 +398,16 @@ public:
 
   void begin() {
     _servo.setExternalDynamic(true);
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, LOW);
     _motor.begin();
     _encoder.begin();
     analogReadResolution(12);
+    analogSetPinAttenuation(PIN_ADC_VIN, ADC_11db);
     analogSetPinAttenuation(PIN_MOTOR_CURRENT, ADC_11db);
+    pinMode(PIN_ADC_VIN, INPUT);
     pinMode(PIN_MOTOR_CURRENT, INPUT);
+    updateInputVoltage(true);
 
     if (_encoder.online()) {
       _encoder.update();
@@ -340,6 +430,7 @@ public:
 
     const bool encoderOk = _encoder.update();
     _currentMa = readCurrentMa();
+    updateInputVoltage(false);
     updateLimiterCurrentFilter();
     updateFaults(encoderOk);
 
@@ -399,12 +490,13 @@ public:
   bool encoderOnline() const { return _encoder.online(); }
   bool motorFaulted() const { return _motor.faulted(); }
   int16_t currentMa() const { return _currentMa; }
+  uint16_t currentRawMv() const { return static_cast<uint16_t>(lroundf(_currentRawMv)); }
   uint8_t errorFlags() const { return _errorFlags; }
 
 private:
   HLS3606Emu &_servo;
   DRV8876Motor _motor;
-  MT6701Encoder _encoder;
+  MagneticEncoder _encoder;
   const char *_prefsName;
   int8_t _loadFeedbackSign;
   float _speedFeedbackBlend;
@@ -430,6 +522,9 @@ private:
   uint16_t _lastGoalRaw = 0;
   uint32_t _lastPositionSaveMs = 0;
   int16_t _currentMa = 0;
+  float _currentRawMv = 0.0f;
+  uint8_t _voltageDecivolts = 60;
+  uint32_t _lastVinSampleMs = 0;
   uint8_t _errorFlags = 0;
 
   int16_t readCurrentMa() {
@@ -437,9 +532,34 @@ private:
     for (uint8_t i = 0; i < 4; ++i) {
       totalMv += analogReadMilliVolts(PIN_MOTOR_CURRENT);
     }
-    const float mv = static_cast<float>(totalMv) / 4.0f;
-    const int16_t ma = static_cast<int16_t>(mv * CURRENT_MA_PER_MV);
+    _currentRawMv = static_cast<float>(totalMv) / 4.0f;
+    const int16_t ma = static_cast<int16_t>(lroundf(_currentRawMv * CURRENT_MA_PER_MV));
     return clampValue<int16_t>(ma, 0, 2000);
+  }
+
+  uint8_t readInputVoltageDecivolts() {
+    uint32_t totalMv = 0;
+    for (uint8_t i = 0; i < 8; ++i) {
+      totalMv += analogReadMilliVolts(PIN_ADC_VIN);
+    }
+    const float adcMv = static_cast<float>(totalMv) / 8.0f;
+    const float vinMv = (adcMv * VIN_DIVIDER_SCALE * VIN_CAL_SCALE) + VIN_CAL_OFFSET_MV;
+    const int value = static_cast<int>(lroundf(vinMv / 100.0f));
+    return static_cast<uint8_t>(clampValue<int>(value, 0, 255));
+  }
+
+  void updateInputVoltage(bool force) {
+    const uint32_t now = millis();
+    if (!force && now - _lastVinSampleMs < 25) return;
+    _lastVinSampleMs = now;
+    const uint8_t measured = readInputVoltageDecivolts();
+    if (force || _voltageDecivolts == 0) {
+      _voltageDecivolts = measured;
+      return;
+    }
+    const float filtered =
+        (static_cast<float>(_voltageDecivolts) * 0.82f) + (static_cast<float>(measured) * 0.18f);
+    _voltageDecivolts = static_cast<uint8_t>(clampValue<int>(lroundf(filtered), 0, 255));
   }
 
   void updateLimiterCurrentFilter() {
@@ -469,7 +589,9 @@ private:
     int16_t limit = hardCurrentLimitMa();
     if (_servo.mode() == 0) {
       const uint16_t command = _servo.regU16(HLS_REG_GOAL_CURRENT_L) & 0x7FFF;
-      limit = min<int16_t>(limit, static_cast<int16_t>(min<uint16_t>(command, HARDWARE_CURRENT_LIMIT_MA)));
+      if (command != 0) {
+        limit = min<int16_t>(limit, static_cast<int16_t>(min<uint16_t>(command, HARDWARE_CURRENT_LIMIT_MA)));
+      }
     }
     return limit;
   }
@@ -720,13 +842,14 @@ private:
 
   float positionSpeedLimit() const {
     const uint16_t command = _servo.regU16(HLS_REG_RUN_SPEED_L) & 0x7FFF;
-    if (command == 0) return 0.0f;
+    if (command == 0) return DEFAULT_POSITION_SPEED_4096_PER_SEC;
     const float limit = static_cast<float>(command) * FEETECH_SPEED_COUNTS_PER_UNIT;
     return constrain(limit, 0.0f, 30000.0f);
   }
 
   float positionAccelLimit() const {
     const uint8_t command = _servo.reg(HLS_REG_GOAL_ACCEL);
+    if (command == 0) return DEFAULT_POSITION_ACCEL_4096_PER_SEC2;
     const float accel = static_cast<float>(command) * 110.0f;
     return constrain(accel, 0.0f, 26000.0f);
   }
@@ -770,13 +893,18 @@ private:
                     (targetLoad * _loadFeedbackBlend);
     const int16_t load = static_cast<int16_t>(constrain(_loadFeedback, -1000.0f, 1000.0f));
 
-    _servo.setHardwareFeedback(position, speed, load, 60, 25, moving ? 1 : 0,
+    _servo.setHardwareFeedback(position, speed, load, _voltageDecivolts, 25, moving ? 1 : 0,
                                static_cast<int16_t>(_currentMa), _errorFlags);
     _servo.setRegU16(HLS_DIAG_RAW14_L, _encoder.lastRaw14());
     setRegI32(HLS_DIAG_MULTI_POS_0, _encoder.position4096());
     _servo.setReg(HLS_DIAG_FIRST_I2C, _encoder.firstAddress());
     _servo.setReg(HLS_DIAG_ACTIVE_I2C, _encoder.activeAddress());
     _servo.setReg(HLS_DIAG_ENCODER_STATUS, _encoder.lastStatus());
+    _servo.setRegU16(HLS_DIAG_CURRENT_RAW_MV_L, currentRawMv());
+    _servo.setRegU16(HLS_DIAG_CURRENT_MA_L, static_cast<uint16_t>(_currentMa));
+    _servo.setRegI16(HLS_DIAG_LAST_EFFORT_MILLI_L,
+                     static_cast<int16_t>(lroundf(_motor.lastEffort() * 1000.0f)));
+    _servo.setReg(HLS_DIAG_ENCODER_TYPE, _encoder.encoderType());
   }
 
   void setRegI32(uint8_t addr, int32_t value) {

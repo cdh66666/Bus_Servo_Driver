@@ -229,14 +229,18 @@ def read_model(bus: FeetechBus, servo_id: int) -> list[int]:
 
 
 def read_diag(bus: FeetechBus, servo_id: int) -> dict:
-    data = bus.read(servo_id, REG_DIAG, 9, timeout=0.35, retries=2)
+    data = bus.read(servo_id, REG_DIAG, 16, timeout=0.35, retries=2)
     multi = int.from_bytes(data[2:6], "little", signed=True)
+    encoder_type = data[15] if len(data) > 15 else 0
+    encoder_name = {1: "MT6701", 2: "AS5600"}.get(encoder_type, "NONE")
     return {
         "raw14": u16(data, 0),
         "multi": multi,
         "first_i2c": data[6],
         "active_i2c": data[7],
         "encoder_status": data[8],
+        "encoder_type": encoder_type,
+        "encoder_name": encoder_name,
     }
 
 

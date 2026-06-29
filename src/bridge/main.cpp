@@ -3,18 +3,19 @@
 #include "HLS3606Emu.h"
 #include "BoardServoHardware.h"
 
-// COM57 firmware:
+// Bridge firmware:
 // - USB CDC is a transparent Feetech official-tool bridge.
 // - This same board also appears on the bus/tool as a virtual HLS3606-like servo.
 // - Default virtual ID is 2; the real factory HLS3915M currently uses ID 1.
 
-static constexpr int8_t PIN_BUS_RX = 20;
-static constexpr int8_t PIN_BUS_TX = 21;
 static constexpr uint32_t USB_BAUD = 115200;
 static constexpr uint32_t DEFAULT_BUS_BAUD = 1000000;
 static constexpr uint32_t SEARCH_TIMEOUT_MS = 8;
 static constexpr uint32_t KNOWN_TIMEOUT_MS = 12;
 static constexpr uint32_t SEARCH_BAUDS[] = {1000000, 115200};
+static constexpr uint8_t KNOWN_FACTORY_HLS_ID = 1;
+static constexpr uint16_t HLS_DEFAULT_GOAL_SPEED = 80;
+static constexpr uint16_t HLS_DEFAULT_GOAL_PWM = 420;
 
 HardwareSerial BusSerial(1);
 HLS3606Emu localServo(2, 0, "hls2m");
@@ -81,15 +82,6 @@ bool sameAsLastForwarded(const uint8_t *raw, uint8_t len) {
   return len == lastForwardedLen && memcmp(raw, lastForwarded, len) == 0;
 }
 
-bool isInstructionEcho(uint8_t id, uint8_t len, const uint8_t *data) {
-  if (id == HLS_BROADCAST_ID) return true;
-  if (len < 2) return false;
-  const uint8_t b = data[0];
-  return b == HLS_INST_PING || b == HLS_INST_READ || b == HLS_INST_WRITE ||
-         b == HLS_INST_REG_WRITE || b == HLS_INST_ACTION || b == HLS_INST_RESET ||
-         b == HLS_INST_SYNC_WRITE;
-}
-
 bool addCandidate(uint32_t *candidates, uint8_t &count, uint32_t baud) {
   if (baud == 0) return false;
   for (uint8_t i = 0; i < count; ++i) {
@@ -137,6 +129,89 @@ void rememberWriteSideEffects(uint8_t oldId, uint8_t inst, const uint8_t *params
     affectedBaud = HLS3606Emu::baudFromCode(newBaudCode);
   }
   idBaud[affectedId] = affectedBaud;
+}
+
+bool writeTouches(uint8_t addr, uint8_t dataLen, uint8_t reg, uint8_t width = 1) {
+  if (dataLen == 0) return false;
+  const uint16_t writeStart = addr;
+  const uint16_t writeEnd = static_cast<uint16_t>(addr) + dataLen;
+  const uint16_t regStart = reg;
+  const uint16_t regEnd = static_cast<uint16_t>(reg) + width;
+  return writeStart < regEnd && regStart < writeEnd;
+}
+
+bool getWriteU16(const uint8_t *params, uint8_t paramLen, uint8_t reg, uint16_t &value) {
+  if (paramLen < 3) return false;
+  const uint8_t addr = params[0];
+  const uint8_t dataLen = paramLen - 1;
+  if (addr > reg || static_cast<uint16_t>(reg) + 2 > static_cast<uint16_t>(addr) + dataLen) {
+    return false;
+  }
+  const uint8_t offset = 1 + (reg - addr);
+  if (offset + 1 >= paramLen) return false;
+  value = static_cast<uint16_t>(params[offset]) |
+          (static_cast<uint16_t>(params[offset + 1]) << 8);
+  return true;
+}
+
+void putWriteU16(uint8_t *params, uint8_t paramLen, uint8_t reg, uint16_t value) {
+  if (paramLen < 3) return;
+  const uint8_t addr = params[0];
+  const uint8_t dataLen = paramLen - 1;
+  if (addr > reg || static_cast<uint16_t>(reg) + 2 > static_cast<uint16_t>(addr) + dataLen) {
+    return;
+  }
+  const uint8_t offset = 1 + (reg - addr);
+  if (offset + 1 >= paramLen) return;
+  params[offset] = static_cast<uint8_t>(value & 0xFF);
+  params[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+}
+
+void buildRawInstruction(uint8_t id, uint8_t inst, const uint8_t *params, uint8_t paramLen,
+                         uint8_t *raw, uint8_t &rawLen) {
+  const uint8_t packetLen = paramLen + 2;
+  raw[0] = 0xFF;
+  raw[1] = 0xFF;
+  raw[2] = id;
+  raw[3] = packetLen;
+  raw[4] = inst;
+  memcpy(raw + 5, params, paramLen);
+  raw[5 + paramLen] = HLS3606Emu::checksum(raw + 2, static_cast<size_t>(packetLen + 1));
+  rawLen = static_cast<uint8_t>(6 + paramLen);
+}
+
+bool normalizePhysicalHlsMotionWrite(uint8_t id, uint8_t inst, const uint8_t *params,
+                                     uint8_t paramLen, uint8_t *patchedParams,
+                                     uint8_t &patchedParamLen,
+                                     uint8_t *patchedRaw, uint8_t &patchedRawLen) {
+  if (id != KNOWN_FACTORY_HLS_ID) return false;
+  if (inst != HLS_INST_WRITE && inst != HLS_INST_REG_WRITE) return false;
+  if (paramLen < 3) return false;
+
+  const uint8_t addr = params[0];
+  const uint8_t dataLen = paramLen - 1;
+  if (!writeTouches(addr, dataLen, HLS_REG_GOAL_POSITION_L, 2)) return false;
+
+  uint16_t speed = 0;
+  const bool hasSpeed = getWriteU16(params, paramLen, HLS_REG_RUN_SPEED_L, speed);
+  if (hasSpeed && speed != 0) return false;
+
+  uint8_t newParamLen = paramLen;
+  if (!hasSpeed) {
+    const uint8_t requiredDataLen =
+        static_cast<uint8_t>((HLS_REG_RUN_SPEED_L + 2) - addr);
+    newParamLen = static_cast<uint8_t>(1 + requiredDataLen);
+  }
+  if (newParamLen > HLS_DATA_MAX) return false;
+
+  memset(patchedParams, 0, HLS_DATA_MAX);
+  patchedParams[0] = addr;
+  for (uint8_t i = 1; i < paramLen; ++i) patchedParams[i] = params[i];
+  patchedParamLen = newParamLen;
+  putWriteU16(patchedParams, patchedParamLen, HLS_REG_GOAL_CURRENT_L, HLS_DEFAULT_GOAL_PWM);
+  putWriteU16(patchedParams, patchedParamLen, HLS_REG_RUN_SPEED_L, HLS_DEFAULT_GOAL_SPEED);
+  buildRawInstruction(id, inst, patchedParams, patchedParamLen, patchedRaw, patchedRawLen);
+  return true;
 }
 
 bool waitForCapturedResponse(uint8_t expectedId, uint32_t timeoutMs);
@@ -195,6 +270,19 @@ void proxyPacketToBus(uint8_t id, uint8_t inst, const uint8_t *params, uint8_t p
   if (id == HLS_BROADCAST_ID) {
     sendBroadcastToKnownBauds(raw, rawLen);
     return;
+  }
+
+  uint8_t patchedParams[HLS_DATA_MAX] = {};
+  uint8_t patchedParamLen = 0;
+  uint8_t patchedRaw[HLS_DATA_MAX + 6] = {};
+  uint8_t patchedRawLen = 0;
+  if (normalizePhysicalHlsMotionWrite(id, inst, params, paramLen,
+                                      patchedParams, patchedParamLen,
+                                      patchedRaw, patchedRawLen)) {
+    params = patchedParams;
+    paramLen = patchedParamLen;
+    raw = patchedRaw;
+    rawLen = patchedRawLen;
   }
 
   uint32_t candidates[6] = {};
@@ -300,6 +388,19 @@ bool waitForCapturedResponse(uint8_t expectedId, uint32_t timeoutMs) {
   return captureReady;
 }
 
+void updateStatusLed() {
+  static uint32_t lastToggleMs = 0;
+  static bool ledOn = false;
+  const uint32_t now = millis();
+  const bool hardwareOk = localHardware.encoderOnline() && localHardware.errorFlags() == 0;
+  const uint32_t intervalMs = hardwareOk ? 500 : 120;
+  if (now - lastToggleMs < intervalMs) return;
+
+  lastToggleMs = now;
+  ledOn = !ledOn;
+  digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
+}
+
 void setup() {
   Serial.begin(USB_BAUD);
   localServo.begin();
@@ -311,6 +412,7 @@ void setup() {
 
 void loop() {
   localHardware.update();
+  updateStatusLed();
   while (Serial.available() > 0) {
     feedParser(usbParser, static_cast<uint8_t>(Serial.read()), handleUsbPacket);
   }

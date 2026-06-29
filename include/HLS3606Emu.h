@@ -68,7 +68,7 @@ static constexpr uint8_t HLS_REG_MOVING = 0x42;
 static constexpr uint8_t HLS_REG_CURRENT_TARGET_L = 0x43;
 static constexpr uint8_t HLS_REG_PRESENT_CURRENT_L = 0x45;
 
-static constexpr size_t HLS_TABLE_SIZE = 96;
+static constexpr size_t HLS_TABLE_SIZE = 112;
 static constexpr size_t HLS_DATA_MAX = 160;
 
 typedef void (*HlsPacketWriter)(const uint8_t *data, size_t len);
@@ -123,6 +123,10 @@ public:
 
   void setRegI16(uint8_t addr, int16_t value) {
     writeU16(addr, static_cast<uint16_t>(value));
+  }
+
+  void savePersistentSettings() {
+    savePersistent();
   }
 
   void setExternalDynamic(bool enabled) {
@@ -369,6 +373,35 @@ private:
     _prefs.end();
   }
 
+  static bool writeTouches(uint8_t addr, uint8_t len, uint8_t reg, uint8_t width = 1) {
+    if (len == 0) return false;
+    const uint16_t writeStart = addr;
+    const uint16_t writeEnd = static_cast<uint16_t>(addr) + len;
+    const uint16_t regStart = reg;
+    const uint16_t regEnd = static_cast<uint16_t>(reg) + width;
+    return writeStart < regEnd && regStart < writeEnd;
+  }
+
+  static bool shouldPersistWrite(uint8_t addr, uint8_t len) {
+    return writeTouches(addr, len, HLS_REG_ID) ||
+           writeTouches(addr, len, HLS_REG_BAUD) ||
+           writeTouches(addr, len, HLS_REG_STATUS_LEVEL) ||
+           writeTouches(addr, len, HLS_REG_MIN_ANGLE_L, 2) ||
+           writeTouches(addr, len, HLS_REG_MAX_ANGLE_L, 2) ||
+           writeTouches(addr, len, HLS_REG_SETTING) ||
+           writeTouches(addr, len, HLS_REG_P) ||
+           writeTouches(addr, len, HLS_REG_D) ||
+           writeTouches(addr, len, HLS_REG_I) ||
+           writeTouches(addr, len, HLS_REG_MIN_PWM_L) ||
+           writeTouches(addr, len, HLS_REG_PROTECT_CURRENT_L, 2) ||
+           writeTouches(addr, len, HLS_REG_MODE) ||
+           writeTouches(addr, len, HLS_REG_CURRENT_P) ||
+           writeTouches(addr, len, HLS_REG_CURRENT_I) ||
+           writeTouches(addr, len, HLS_REG_VELOCITY_P) ||
+           writeTouches(addr, len, HLS_REG_VELOCITY_I) ||
+           writeTouches(addr, len, HLS_REG_TORQUE_LIMIT_L, 2);
+  }
+
   bool shouldReturnStatus(uint8_t inst, bool broadcast) const {
     if (broadcast) return inst == HLS_INST_PING;
     if (inst == HLS_INST_PING || inst == HLS_INST_READ) return true;
@@ -461,7 +494,7 @@ private:
     }
     if (_table[HLS_REG_ID] > 253) _table[HLS_REG_ID] = _defaultId;
     if (_table[HLS_REG_BAUD] > 7) _table[HLS_REG_BAUD] = _defaultBaudCode;
-    savePersistent();
+    if (shouldPersistWrite(addr, len)) savePersistent();
   }
 
   void handleWriteLike(uint8_t inst, const uint8_t *params, uint8_t paramLen,
